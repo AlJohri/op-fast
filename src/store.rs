@@ -3,6 +3,8 @@ mod db;
 pub use db::{Db, Meta};
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::env;
 use std::time::Duration;
 
 pub fn init() -> anyhow::Result<()> {
@@ -10,10 +12,49 @@ pub fn init() -> anyhow::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        let store = linux_keyutils_keyring_store::Store::new_with_configuration(&config)
-            .map_err(|e| anyhow::anyhow!("Failed to initialize Linux keyutils store: {}", e))?;
-        keyring_core::set_default_store(store);
-        Ok(())
+        // Keyutils keys live in kernel memory, so every cache entry is lost on
+        // reboot. Secret Service is disk-backed and matches what the macOS and
+        // BSD builds give. Keyutils stays reachable for sessions without a
+        // Secret Service provider, such as a headless box with no D-Bus.
+        let backend = env::var("OP_FAST_KEYRING").unwrap_or_else(|_| "secret-service".into());
+        match backend.as_str() {
+            "secret-service" => {
+                match dbus_secret_service_keyring_store::Store::new_with_configuration(&config) {
+                    Ok(store) => {
+                        keyring_core::set_default_store(store);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Secret Service unavailable ({}), falling back to keyutils",
+                            e
+                        );
+                        let store =
+                            linux_keyutils_keyring_store::Store::new_with_configuration(&config)
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "Failed to initialize Linux keyutils store: {}",
+                                        e
+                                    )
+                                })?;
+                        keyring_core::set_default_store(store);
+                        Ok(())
+                    }
+                }
+            }
+            "keyutils" => {
+                let store = linux_keyutils_keyring_store::Store::new_with_configuration(&config)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to initialize Linux keyutils store: {}", e)
+                    })?;
+                keyring_core::set_default_store(store);
+                Ok(())
+            }
+            other => anyhow::bail!(
+                "Unknown OP_FAST_KEYRING value: {} (expected \"secret-service\" or \"keyutils\")",
+                other
+            ),
+        }
     }
 
     #[cfg(target_os = "macos")]

@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,12 +11,17 @@ const DIR_NAME: &str = "op-fast";
 const DB_NAME: &str = "store.mdb";
 const SERVICE_NAME: &str = "op-fast";
 
-// gnome-keyring writes a password-less collection as a flat INI file, one
-// `secret=` line per item, and then fails to parse back any secret that
-// contained a newline: the whole keyring is rejected at startup as
-// "invalid or unrecognized format" and every item in it is lost. So a value
-// carrying a control character is stored JSON-escaped behind this marker.
-const ESCAPED_PREFIX: &str = "op-fast:json:";
+// gnome-keyring writes a password-less collection as a flat INI file and
+// mishandles two characters there. A newline breaks the file's grammar, so the
+// whole keyring is rejected at startup as "invalid or unrecognized format" and
+// every item in it is lost. A backslash survives the write but the secret comes
+// back empty in the next process -- the write reports success, so the loss is
+// silent. Hex keeps a value clear of both, at the cost of doubling its length.
+const ENCODED_PREFIX: &str = "op-fast:hex:";
+
+fn is_storable(value: &str) -> bool {
+    !value.bytes().any(|b| b == b'\\' || b.is_ascii_control())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
@@ -196,25 +202,39 @@ impl Db {
     }
 
     fn encode(value: &str) -> String {
-        if !value.chars().any(char::is_control) {
+        if is_storable(value) {
             return value.to_string();
         }
-        match serde_json::to_string(value) {
-            Ok(json) => format!("{ESCAPED_PREFIX}{json}"),
-            Err(_) => value.to_string(),
+        let mut out = String::with_capacity(ENCODED_PREFIX.len() + value.len() * 2);
+        out.push_str(ENCODED_PREFIX);
+        for byte in value.as_bytes() {
+            let _ = write!(out, "{byte:02x}");
         }
+        out
     }
 
-    // A raw secret that happens to open with the marker fails to parse and is
+    // A raw secret that happens to open with the marker fails to decode and is
     // returned unchanged, so the marker needs no reservation.
     fn decode(stored: String) -> String {
-        let Some(json) = stored.strip_prefix(ESCAPED_PREFIX) else {
+        let Some(hex) = stored.strip_prefix(ENCODED_PREFIX).map(str::to_owned) else {
             return stored;
         };
-        match serde_json::from_str::<String>(json) {
-            Ok(value) => value,
-            Err(_) => stored,
+        // encode() never writes a bare marker, so an empty payload means the
+        // stored value is a raw secret that happens to look like one.
+        if hex.is_empty() || hex.len() % 2 != 0 {
+            return stored;
         }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().chunks(2) {
+            let Ok(text) = std::str::from_utf8(pair) else {
+                return stored;
+            };
+            match u8::from_str_radix(text, 16) {
+                Ok(byte) => bytes.push(byte),
+                Err(_) => return stored,
+            }
+        }
+        String::from_utf8(bytes).unwrap_or(stored)
     }
 
     fn keyring_delete(reference: &str) -> Result<bool> {
@@ -233,25 +253,39 @@ mod tests {
     use super::Db;
 
     #[test]
-    fn single_line_values_are_stored_verbatim() {
-        for value in ["", "token", "op-fast:json:not-really", "a=b c"] {
+    fn storable_values_are_kept_verbatim() {
+        for value in ["", "token", "op-fast:hex:zz", "a=b c", "pa$$ w/ord"] {
             assert_eq!(Db::encode(value), value);
             assert_eq!(Db::decode(Db::encode(value)), value);
         }
     }
 
     #[test]
-    fn control_characters_round_trip_on_one_line() {
-        let value = "{\n  \"token\": \"ya29\",\r\n  \"scopes\": []\n}\n";
-        let encoded = Db::encode(value);
-        assert!(!encoded.contains('\n'));
-        assert!(!encoded.contains('\r'));
-        assert_eq!(Db::decode(encoded), value);
+    fn newlines_and_backslashes_round_trip() {
+        for value in [
+            "{\n  \"token\": \"ya29\",\r\n  \"scopes\": []\n}\n",
+            "a\\nb",
+            "C:\\Users\\x",
+            "tab\there",
+        ] {
+            let encoded = Db::encode(value);
+            assert!(super::is_storable(&encoded), "{encoded} is not storable");
+            assert!(encoded.starts_with(super::ENCODED_PREFIX));
+            assert_eq!(Db::decode(encoded), value);
+        }
     }
 
     #[test]
     fn a_raw_value_wearing_the_marker_survives() {
-        let value = "op-fast:json:{oops";
-        assert_eq!(Db::decode(value.to_string()), value);
+        for value in ["op-fast:hex:xyz", "op-fast:hex:abc", "op-fast:hex:"] {
+            assert_eq!(Db::decode(value.to_string()), value);
+        }
+    }
+
+    #[test]
+    fn non_utf8_hex_falls_back_to_the_stored_string() {
+        // ff is not valid UTF-8 on its own.
+        let value = format!("{}ff", super::ENCODED_PREFIX);
+        assert_eq!(Db::decode(value.clone()), value);
     }
 }

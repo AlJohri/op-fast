@@ -10,6 +10,13 @@ const DIR_NAME: &str = "op-fast";
 const DB_NAME: &str = "store.mdb";
 const SERVICE_NAME: &str = "op-fast";
 
+// gnome-keyring writes a password-less collection as a flat INI file, one
+// `secret=` line per item, and then fails to parse back any secret that
+// contained a newline: the whole keyring is rejected at startup as
+// "invalid or unrecognized format" and every item in it is lost. So a value
+// carrying a control character is stored JSON-escaped behind this marker.
+const ESCAPED_PREFIX: &str = "op-fast:json:";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub stored_at: u64,
@@ -175,7 +182,7 @@ impl Db {
         let entry = Self::keyring_entry(reference)?;
 
         match entry.get_password() {
-            Ok(value) => Ok(Some(value)),
+            Ok(value) => Ok(Some(Self::decode(value))),
             Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(e) => Err(anyhow::anyhow!("Keyring error: {}", e)),
         }
@@ -184,8 +191,30 @@ impl Db {
     fn keyring_put(reference: &str, value: &str) -> Result<()> {
         let entry = Self::keyring_entry(reference)?;
         entry
-            .set_password(value)
+            .set_password(&Self::encode(value))
             .context("Failed to store value in keyring")
+    }
+
+    fn encode(value: &str) -> String {
+        if !value.chars().any(char::is_control) {
+            return value.to_string();
+        }
+        match serde_json::to_string(value) {
+            Ok(json) => format!("{ESCAPED_PREFIX}{json}"),
+            Err(_) => value.to_string(),
+        }
+    }
+
+    // A raw secret that happens to open with the marker fails to parse and is
+    // returned unchanged, so the marker needs no reservation.
+    fn decode(stored: String) -> String {
+        let Some(json) = stored.strip_prefix(ESCAPED_PREFIX) else {
+            return stored;
+        };
+        match serde_json::from_str::<String>(json) {
+            Ok(value) => value,
+            Err(_) => stored,
+        }
     }
 
     fn keyring_delete(reference: &str) -> Result<bool> {
@@ -196,5 +225,33 @@ impl Db {
             Err(keyring_core::Error::NoEntry) => Ok(false),
             Err(e) => Err(anyhow::anyhow!("Keyring error: {}", e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Db;
+
+    #[test]
+    fn single_line_values_are_stored_verbatim() {
+        for value in ["", "token", "op-fast:json:not-really", "a=b c"] {
+            assert_eq!(Db::encode(value), value);
+            assert_eq!(Db::decode(Db::encode(value)), value);
+        }
+    }
+
+    #[test]
+    fn control_characters_round_trip_on_one_line() {
+        let value = "{\n  \"token\": \"ya29\",\r\n  \"scopes\": []\n}\n";
+        let encoded = Db::encode(value);
+        assert!(!encoded.contains('\n'));
+        assert!(!encoded.contains('\r'));
+        assert_eq!(Db::decode(encoded), value);
+    }
+
+    #[test]
+    fn a_raw_value_wearing_the_marker_survives() {
+        let value = "op-fast:json:{oops";
+        assert_eq!(Db::decode(value.to_string()), value);
     }
 }
